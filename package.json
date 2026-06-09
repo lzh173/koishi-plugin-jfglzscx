@@ -2,19 +2,27 @@
   "name": "koishi-plugin-jfglzscx",
   "description": "查询机房管理助手版本",
   "version": "0.0.1",
+  "contributors": [     
+    "lzh173 <1294092988@qq.com>"
+
+  ],
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
     "lib",
     "dist"
   ],
-  "license": "MIT",
+  "license": "AGPL",
   "scripts": {},
   "keywords": [
     "chatbot",
     "koishi",
     "plugin"
   ],
+   "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lzh173/koishi-plugin-jfglzscx.git"
+  },
   "devDependencies": {
     "@koishijs/scripts": "^4.6.2",
     "@types/node": "^25.9.2",
