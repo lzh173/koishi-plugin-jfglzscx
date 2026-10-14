@@ -57,6 +57,24 @@ interface LanzouFile {
   size: string
 }
 
+function dateTag() {
+  const now = new Date()
+  const year = String(now.getFullYear()).slice(-2)
+  return `${year}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`
+}
+
+function splitFileName(name: string) {
+  const match = name.match(/^(.*?)(\.[^.]+)?$/)
+  return { base: match?.[1] || name, ext: match?.[2] || '' }
+}
+
+function safeFileName(name: string, version?: string, hash?: string) {
+  const { base, ext } = splitFileName(name)
+  const cleanBase = base.replace(/[\\/:*?"<>|]/g, '_').trim() || '下载文件'
+  const suffix = version ? `机房管理助手-${version}` : cleanBase
+  return `${suffix}-${dateTag()}-${hash?.slice(-6) || 'unknown'}${ext}`
+}
+
 async function resolveLanzouDownload(
   browser: BrowserService,
   shareUrl: string,
@@ -219,11 +237,26 @@ export function apply(ctx: Context, config: Config) {
 
       logger.info('[发送] 检测到新哈希，发送安装包文件')
       await session.send(summary)
-      await session.send(h.file(result.data, 'application/zip'))
+      const version = resolved.file.name.match(/(V[\d.]+)/i)?.[1] || undefined
+      const outputName = safeFileName(resolved.file.name, version, result.sha256)
+      const mime = resolved.file.name.toLowerCase().endsWith('.zip') ? 'application/zip' : 'application/octet-stream'
+      logger.info(`[发送] 文件名: ${outputName}`)
+      await session.send(h('file', {
+        src: `data:${mime};base64,${result.data.toString('base64')}`,
+        filename: outputName,
+      }))
       await mkdir(join(process.cwd(), 'data'), { recursive: true })
-      await writeFile(hashFile, JSON.stringify({ sha256: result.sha256, file: resolved.file.name }, null, 2), 'utf8')
+      let savedHashes: Record<string, string> = {}
+      try {
+        const saved = JSON.parse(await readTextFile(hashFile, 'utf8')) as Record<string, unknown>
+        savedHashes = Object.entries(saved).reduce<Record<string, string>>((result, [key, value]) => {
+          if (typeof value === 'string') result[key] = value
+          return result
+        }, {})
+      } catch {}
+      await writeFile(hashFile, JSON.stringify({ ...savedHashes, sha256: result.sha256, file: resolved.file.name }, null, 2), 'utf8')
       logger.info(`[发送] 文件发送成功，已保存本次哈希: ${hashFile}`)
-      return '安装包已发送。'
+      return
     } catch (error) {
       logger.error('下载或哈希计算失败:', error)
       return `下载失败：${error instanceof Error ? error.message : String(error)}`
@@ -235,8 +268,49 @@ export function apply(ctx: Context, config: Config) {
   ctx.command('jfglzscx.download', '下载最新安装包并计算哈希')
     .action(downloadLatest)
 
-  ctx.command('蓝奏云下载', '解析蓝奏云并下载最新安装包')
-    .action(downloadLatest)
+  const downloadShared = async ({ session }: { session?: { send(message: any): Promise<unknown> } }, url: string, password = '123') => {
+    if (!url) return '用法：蓝奏云下载 <蓝奏云链接> [密码]'
+    const browser = (ctx as Context & { puppeteer?: BrowserService }).puppeteer
+    if (!browser) return '下载功能需要启用 koishi-plugin-puppeteer'
+    if (!session) return '此命令只能在会话中使用'
+    await session.send('正在解析指定蓝奏云链接并下载文件，请稍候...')
+    let downloadPage: BrowserPage | undefined
+    try {
+      const resolved = await resolveLanzouDownload(browser, url, password, /.+/, logger)
+      downloadPage = resolved.page
+      const result = await downloadAndHash(resolved.page, config.maxDownloadSize * 1024 * 1024, logger)
+      const { base, ext } = splitFileName(resolved.file.name)
+      const outputName = safeFileName(resolved.file.name, undefined, result.sha256)
+      const hashFile = join(process.cwd(), 'data', 'jfglzscx-last-hash.json')
+      let lastHash = ''
+      try {
+        const saved = JSON.parse(await readTextFile(hashFile, 'utf8')) as Record<string, string>
+        lastHash = saved[url] || ''
+      } catch {}
+      if (lastHash === result.sha256) return `文件：${base}${ext}\nSHA-256：${result.sha256}\n文件内容未变化，本次不重复发送。`
+      await session.send(`文件：${resolved.file.name}\n大小：${(result.bytes / 1024 / 1024).toFixed(2)} MB\nSHA-256：${result.sha256}\nMD5：${result.md5}`)
+      await session.send(h('file', { src: `data:application/octet-stream;base64,${result.data.toString('base64')}`, filename: outputName }))
+      await mkdir(join(process.cwd(), 'data'), { recursive: true })
+      let savedHashes: Record<string, string> = {}
+      try {
+        const saved = JSON.parse(await readTextFile(hashFile, 'utf8')) as Record<string, unknown>
+        savedHashes = Object.entries(saved).reduce<Record<string, string>>((result, [key, value]) => {
+          if (typeof value === 'string') result[key] = value
+          return result
+        }, {})
+      } catch {}
+      await writeFile(hashFile, JSON.stringify({ ...savedHashes, [url]: result.sha256 }, null, 2), 'utf8')
+      logger.info(`[发送] 指定文件发送成功: ${outputName}`)
+    } catch (error) {
+      logger.error('指定蓝奏云下载失败:', error)
+      return `下载失败：${error instanceof Error ? error.message : String(error)}`
+    } finally {
+      await downloadPage?.close()
+    }
+  }
+
+  ctx.command('蓝奏云下载 <url:text> [password:text]', '解析指定蓝奏云链接并下载文件')
+    .action(downloadShared)
 
   ctx.command('jfglzscx', '获取机房管理助手最新版本信息')
     .action(async ({ session }) => {

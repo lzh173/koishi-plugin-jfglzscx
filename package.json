@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-jfglzscx",
   "description": "查询机房管理助手版本",
-  "version": "0.0.5",
+  "version": "0.1.0",
   "contributors": [
     "lzh173 <1294092988@qq.com>"
   ],
