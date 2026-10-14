@@ -1,13 +1,20 @@
-import { Context, Schema } from 'koishi'
+import { Context, Schema, h } from 'koishi'
 import axios from 'axios'
 import * as cheerio from 'cheerio'
 import * as iconv from 'iconv-lite'
+import { createHash } from 'node:crypto'
+import { mkdir, readdir, rm, stat, readFile as readTextFile, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { readFile } from 'node:fs/promises'
 
 export const name = 'jfglzscx'
+export const inject = ['puppeteer']
 
 export interface Config {
   timeout: number
   userAgent: string
+  maxDownloadSize: number
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -19,10 +26,217 @@ export const Config: Schema<Config> = Schema.object({
   userAgent: Schema.string()
     .description('自定义 User-Agent')
     .default('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'),
+  maxDownloadSize: Schema.number()
+    .description('单次下载上限（MB）')
+    .default(512)
+    .min(1)
+    .max(4096),
 })
+
+interface BrowserPage {
+  goto(url: string, options?: Record<string, unknown>): Promise<unknown>
+  type(selector: string, text: string): Promise<void>
+  click(selector: string): Promise<void>
+  waitForFunction(pageFunction: string | (() => unknown), options?: Record<string, unknown>): Promise<unknown>
+  waitForSelector(selector: string, options?: Record<string, unknown>): Promise<unknown>
+  $eval<T>(selector: string, pageFunction: (element: any) => T): Promise<T>
+  $$eval<T>(selector: string, pageFunction: (elements: any[]) => T): Promise<T>
+  target(): { createCDPSession(): Promise<{ send(method: string, params: Record<string, unknown>): Promise<unknown> }> }
+  frames(): Array<{ url(): string; click(selector: string): Promise<void> }>
+  url(): string
+  close(): Promise<void>
+}
+
+interface BrowserService {
+  page(): Promise<BrowserPage>
+}
+
+interface LanzouFile {
+  id: string
+  name: string
+  size: string
+}
+
+async function resolveLanzouDownload(
+  browser: BrowserService,
+  shareUrl: string,
+  password: string,
+  filePattern: RegExp,
+  logger: { info(message: string): void },
+): Promise<{ file: LanzouFile; page: BrowserPage }> {
+  const startedAt = Date.now()
+  logger.info(`[解析] 创建浏览器页面，分享地址: ${shareUrl}`)
+  const page = await browser.page()
+  try {
+    logger.info('[解析] 正在打开蓝奏云分享页')
+    await page.goto(shareUrl, { waitUntil: 'networkidle2', timeout: 30000 })
+    logger.info(`[解析] 分享页加载完成，当前地址: ${page.url()}`)
+    await page.type('#pwd', password)
+    await page.click('#sub')
+    logger.info('[解析] 已提交分享密码，等待文件列表')
+    await page.waitForFunction(
+      () => Boolean(document.querySelector('#infos a')),
+      { timeout: 30000 },
+    )
+
+    const files = await page.$$eval('#infos a', (links) => links.map((link) => ({
+      id: link.getAttribute('href') || '',
+      name: (link.textContent || '').trim(),
+      size: link.parentElement?.parentElement?.querySelector('#size')?.textContent?.trim() || '',
+    })))
+    logger.info(`[解析] 文件列表获取成功，共 ${files.length} 个文件: ${files.map((item) => item.name).join(', ')}`)
+    const file = files.find((item) => filePattern.test(item.name))
+    if (!file?.id) throw new Error('网盘中没有匹配的安装包')
+    logger.info(`[解析] 已匹配安装包: ${file.name}，标识: ${file.id}，页面显示大小: ${file.size || '未知'}`)
+
+    const detailUrl = new URL(file.id, page.url()).href
+    logger.info(`[解析] 正在打开文件详情页: ${detailUrl}`)
+    await page.goto(detailUrl, { waitUntil: 'networkidle2', timeout: 30000 })
+    await page.waitForSelector('iframe.ifr2', { timeout: 30000 })
+    logger.info(`[解析] 详情页加载完成，当前地址: ${page.url()}，等待下载 iframe`)
+    await page.waitForFunction(
+      () => Boolean(
+        (document.querySelector('iframe.ifr2') as HTMLIFrameElement | null)
+          ?.contentDocument?.querySelector('a.txt[href*="/file/"]'),
+      ),
+      { timeout: 30000, polling: 250 },
+    )
+    logger.info(`[解析] 已找到下载入口，总耗时 ${Date.now() - startedAt} ms`)
+
+    return { file, page }
+  } catch (error) {
+    logger.info(`[解析] 失败，耗时 ${Date.now() - startedAt} ms: ${error instanceof Error ? error.message : String(error)}`)
+    await page.close()
+    throw error
+  }
+}
+
+async function downloadAndHash(
+  page: BrowserPage,
+  maxBytes: number,
+  logger: { info(message: string): void },
+) {
+  const dir = join(tmpdir(), 'koishi-jfglzscx')
+  const startedAt = Date.now()
+  logger.info(`[下载] 准备临时目录: ${dir}，大小上限: ${Math.round(maxBytes / 1024 / 1024)} MB`)
+  await mkdir(dir, { recursive: true })
+  const client = await page.target().createCDPSession()
+  await client.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: dir })
+  const frame = page.frames().find((item) => item.url().includes('/fn?'))
+  if (!frame) throw new Error('未找到蓝奏云下载窗口')
+  logger.info(`[下载] 已找到下载 iframe: ${frame.url()}`)
+  await frame.click('a.txt[href*="/file/"]')
+  logger.info('[下载] 已点击真实下载链接，等待浏览器写入文件')
+  let filePath = ''
+  let lastReportedBytes = -1
+  try {
+    for (let i = 0; i < 180; i++) {
+      const files = await readdir(dir)
+      const candidate = files.find((name) => !name.endsWith('.crdownload'))
+      if (candidate) {
+        filePath = join(dir, candidate)
+        logger.info(`[下载] 文件下载完成: ${candidate}，等待读取和校验`)
+        break
+      }
+      const partial = files.find((name) => name.endsWith('.crdownload'))
+      if (partial) {
+        const partialBytes = (await stat(join(dir, partial))).size
+        if (partialBytes - lastReportedBytes >= 5 * 1024 * 1024) {
+          logger.info(`[下载] 进行中: ${partial}，已接收 ${(partialBytes / 1024 / 1024).toFixed(2)} MB`)
+          lastReportedBytes = partialBytes
+        }
+        if (partialBytes > maxBytes) {
+          throw new Error(`文件超过 ${Math.round(maxBytes / 1024 / 1024)} MB 限制`)
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+    }
+    if (!filePath) throw new Error('下载超时')
+    const data = await readFile(filePath)
+    logger.info(`[下载] 已读取文件 ${(data.length / 1024 / 1024).toFixed(2)} MB，耗时 ${Date.now() - startedAt} ms`)
+    if (data.length > maxBytes) throw new Error(`文件超过 ${Math.round(maxBytes / 1024 / 1024)} MB 限制`)
+    const result = {
+      data,
+      bytes: data.length,
+      sha256: createHash('sha256').update(data).digest('hex'),
+      md5: createHash('md5').update(data).digest('hex'),
+    }
+    logger.info(`[校验] SHA-256: ${result.sha256}`)
+    logger.info(`[校验] MD5: ${result.md5}`)
+    await rm(dir, { recursive: true, force: true })
+    logger.info(`[下载] 临时文件已清理，总耗时 ${Date.now() - startedAt} ms`)
+    return result
+  } catch (error) {
+    await rm(dir, { recursive: true, force: true })
+    logger.info(`[下载] 失败后已清理临时目录: ${error instanceof Error ? error.message : String(error)}`)
+    throw error
+  }
+}
 
 export function apply(ctx: Context, config: Config) {
   const logger = ctx.logger('jfglzscx')
+
+  const downloadLatest = async ({ session }: { session?: { send(message: any): Promise<unknown> } }) => {
+    const browser = (ctx as Context & { puppeteer?: BrowserService }).puppeteer
+    if (!browser) return '下载功能需要启用 koishi-plugin-puppeteer'
+    if (!session) return '此命令只能在会话中使用'
+
+    const shareUrl = 'https://wwbun.lanzoum.com/b01884al5e'
+    logger.info(`[命令] 收到下载安装包请求，命令来源: ${session ? '会话' : '未知'}，最大下载大小: ${config.maxDownloadSize} MB`)
+    await session.send('正在解析网盘并下载最新安装包，请稍候...')
+    let downloadPage: BrowserPage | undefined
+    try {
+      const resolved = await resolveLanzouDownload(
+        browser,
+        shareUrl,
+        '123',
+        /学生机房管理助手.*\.(zip|rar|7z)$/i,
+        logger,
+      )
+      downloadPage = resolved.page
+      logger.info(`[命令] 开始下载匹配文件: ${resolved.file.name}`)
+      const result = await downloadAndHash(resolved.page, config.maxDownloadSize * 1024 * 1024, logger)
+      const hashFile = join(process.cwd(), 'data', 'jfglzscx-last-hash.json')
+      let lastHash = ''
+      try {
+        const saved = JSON.parse(await readTextFile(hashFile, 'utf8')) as { sha256?: string }
+        lastHash = saved.sha256 || ''
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          logger.info(`[比对] 读取上次哈希失败，将按新文件处理: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+      const changed = result.sha256 !== lastHash
+      logger.info(`[命令] 下载并校验成功: ${resolved.file.name}，${result.bytes} 字节，${changed ? '哈希有变化' : '哈希未变化'}`)
+      const summary = [
+        `文件：${resolved.file.name}`,
+        `大小：${(result.bytes / 1024 / 1024).toFixed(2)} MB`,
+        `SHA-256：${result.sha256}`,
+        `MD5：${result.md5}`,
+        `解压密码：123`,
+      ].join('\n')
+      if (!changed) return `${summary}\n\n文件内容与上次已发送版本一致，本次不重复发送。`
+
+      logger.info('[发送] 检测到新哈希，发送安装包文件')
+      await session.send(summary)
+      await session.send(h.file(result.data, 'application/zip'))
+      await mkdir(join(process.cwd(), 'data'), { recursive: true })
+      await writeFile(hashFile, JSON.stringify({ sha256: result.sha256, file: resolved.file.name }, null, 2), 'utf8')
+      logger.info(`[发送] 文件发送成功，已保存本次哈希: ${hashFile}`)
+      return '安装包已发送。'
+    } catch (error) {
+      logger.error('下载或哈希计算失败:', error)
+      return `下载失败：${error instanceof Error ? error.message : String(error)}`
+    } finally {
+      await downloadPage?.close()
+    }
+  }
+
+  ctx.command('jfglzscx.download', '下载最新安装包并计算哈希')
+    .action(downloadLatest)
+
+  ctx.command('蓝奏云下载', '解析蓝奏云并下载最新安装包')
+    .action(downloadLatest)
 
   ctx.command('jfglzscx', '获取机房管理助手最新版本信息')
     .action(async ({ session }) => {

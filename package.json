@@ -1,10 +1,9 @@
 {
   "name": "koishi-plugin-jfglzscx",
   "description": "查询机房管理助手版本",
-  "version": "0.0.1",
-  "contributors": [     
+  "version": "0.0.5",
+  "contributors": [
     "lzh173 <1294092988@qq.com>"
-
   ],
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
@@ -19,7 +18,7 @@
     "koishi",
     "plugin"
   ],
-   "repository": {
+  "repository": {
     "type": "git",
     "url": "git+https://github.com/lzh173/koishi-plugin-jfglzscx.git"
   },
